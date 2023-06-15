@@ -1,111 +1,79 @@
 import openai
-from termcolor import colored
 import streamlit as st
+from termcolor import colored
+from database import establish_redis_connection, fetch_redis_results
+from config import CHAT_BOT_MODEL, PROMPTS_MODEL, INDEX_LABEL
 
-from database import get_redis_connection, get_redis_results
+redis_server = establish_redis_connection()
 
-from config import CHAT_MODEL, COMPLETIONS_MODEL, INDEX_NAME
-
-redis_client = get_redis_connection()
-
-# A basic class to create a message as a dict for chat
-class Message:
-    
-    def __init__(self, role,content):
+class Dialogue:
+    def __init__(self, role, text):
         self.role = role
-        self.content = content
-        
-    def message(self):
-        return {
-            "role": self.role,
-            "content": self.content
-        }
+        self.text = text
+
+    def to_dict(self):
+        return {"role": self.role, "content": self.text}
 
 
-# New Assistant class to add a vector database call to its responses
-class RetrievalAssistant:
-    
+class SearchBasedAssistant:
     def __init__(self):
-        self.conversation_history = []  
+        self.dialogue_history = []  
 
-    def _get_assistant_response(self, prompt):
+    def _fetch_assistant_reply(self, prompt):
         try:
-            completion = openai.ChatCompletion.create(
-              model=CHAT_MODEL,
+            response = openai.ChatCompletion.create(
+              model=CHAT_BOT_MODEL,
               messages=prompt,
               temperature=0.1
             )
-            
-            response_message = Message(
-                completion['choices'][0]['message']['role'],
-                completion['choices'][0]['message']['content']
+            assistant_message = Dialogue(
+                response['choices'][0]['message']['role'],
+                response['choices'][0]['message']['content']
             )
-            return response_message.message()
-            
+            return assistant_message.to_dict()
         except Exception as e:
-
             return f'Request failed with exception {e}'
-    
-    # The function to retrieve Redis search results
 
-    def _get_search_results(self,prompt):
-        latest_question = prompt
-        search_content = get_redis_results(
-            redis_client,latest_question, 
-            INDEX_NAME
+    def _retrieve_search_results(self, prompt):
+        recent_query = prompt
+        search_results = fetch_redis_results(
+            redis_server, recent_query, 
+            INDEX_LABEL
         )['result'][0]
-
-        return search_content
+        return search_results
         
-    def ask_assistant(self, next_user_prompt):
-        [self.conversation_history.append(x) for x in next_user_prompt]
-        assistant_response = self._get_assistant_response(self.conversation_history)
-        
-        # Answer normally unless the trigger sequence is used "searching_for_answers"
-        if 'searching for answers' in assistant_response['content'].lower():
-            question_extract = openai.Completion.create(
-                model = COMPLETIONS_MODEL, 
+    def interact_with_assistant(self, new_user_prompt):
+        [self.dialogue_history.append(item) for item in new_user_prompt]
+        assistant_reply = self._fetch_assistant_reply(self.dialogue_history)
+        if 'searching for answers' in assistant_reply['content'].lower():
+            query_extract = openai.Completion.create(
+                model = PROMPTS_MODEL, 
                 prompt=f'''
                 Extract the user's latest question and the year for that question from this 
-                conversation: {self.conversation_history}. Extract it as a sentence stating the Question and Year"
+                conversation: {self.dialogue_history}. Extract it as a sentence stating the Question and Year."
             '''
             )
-            search_result = self._get_search_results(question_extract['choices'][0]['text'])
-            
-            # We insert an extra system prompt here to give fresh context to the Chatbot on how to use the Redis results
-            # In this instance we add it to the conversation history, but in production it may be better to hide
-            self.conversation_history.insert(
+            redis_search_results = self._retrieve_search_results(query_extract['choices'][0]['text'])
+            self.dialogue_history.insert(
                 -1,{
                 "role": 'system',
                 "content": f'''
-                Answer the user's question using this content: {search_result}. 
+                Answer the user's question using this content: {redis_search_results}. 
                 If you cannot answer the question, say 'Sorry, I don't know the answer to this one'
                 '''
                 }
             )
-            
-            assistant_response = self._get_assistant_response(
-                self.conversation_history
-                )
-            
-            self.conversation_history.append(assistant_response)
-            return assistant_response
+            assistant_reply = self._fetch_assistant_reply(self.dialogue_history)
+            self.dialogue_history.append(assistant_reply)
+            return assistant_reply
         else:
-            self.conversation_history.append(assistant_response)
-            return assistant_response
+            self.dialogue_history.append(assistant_reply)
+            return assistant_reply
             
-    def pretty_print_conversation_history(
-            self, 
-            colorize_assistant_replies=True):
-        
-        for entry in self.conversation_history:
-            if entry['role']=='system':
-                pass
-            else:
-                prefix = entry['role']
-                content = entry['content']
-                if colorize_assistant_replies and entry['role'] == 'assistant':
-                    output = colored(f"{prefix}:\n{content}, green")
-                else:
-                    output = colored(f"{prefix}:\n{content}")
-                print(output)
+    def display_conversation_history(self, highlight_assistant_responses=True):
+        for dialogue in self.dialogue_history:
+            if dialogue['role'] == 'system':
+                continue
+            prefix = dialogue['role']
+            content = dialogue['content']
+            print(colored(f"{prefix}:\n{content}", "green" if highlight_assistant_responses and dialogue['role'] == 'assistant' else None))
